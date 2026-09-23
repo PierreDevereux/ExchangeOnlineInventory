@@ -76,7 +76,7 @@
 .PARAMETER OutputPath
     Full path (including file name) for the CSV output. If omitted, the file is
     written to the current directory as:
-        ExchangeOnlineInventory_<yyyyMMdd_HHmmss>.csv
+        ExchangeOnlineInventory_<OrganisationName>_<yyyyMMdd_HHmmss>.csv
 
 .EXAMPLE
     .\ExchangeOnlineInventory.ps1
@@ -101,7 +101,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [string]$OutputPath = (Join-Path -Path (Get-Location) -ChildPath ("ExchangeOnlineInventory_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss')))
+    [string]$OutputPath
 )
 
 # Tracks whether THIS script opened the EXO connection, so we only disconnect
@@ -225,6 +225,22 @@ try {
 catch {
     Write-Error "Failed to connect to Exchange Online: $($_.Exception.Message)"
     return
+}
+
+# --- Build default output path using the organisation name --------------------
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $orgName = 'UnknownOrg'
+    try {
+        $orgName = (Get-OrganizationConfig -ErrorAction Stop).Name
+    }
+    catch {
+        Write-Warning "Could not determine organisation name; using '$orgName'."
+    }
+
+    # Strip characters that are not valid in Windows file names.
+    $safeOrg = ($orgName -replace '[\\/:*?"<>|]', '_')
+    $fileName = 'ExchangeOnlineInventory_{0}_{1}.csv' -f $safeOrg, (Get-Date -Format 'yyyyMMdd_HHmmss')
+    $OutputPath = Join-Path -Path (Get-Location) -ChildPath $fileName
 }
 
 # --- Inventory ----------------------------------------------------------------
