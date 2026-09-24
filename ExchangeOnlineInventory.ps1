@@ -2,7 +2,7 @@
 .SYNOPSIS
     Inventories all Exchange Online mailboxes (user, shared, room, equipment, etc.)
     and their in-place archives, and exports size, item count, and oldest/newest
-    message dates to a CSV file for reconciliation against a Mimecast report.
+    message dates to a CSV file.
 
 .DESCRIPTION
     This script connects to Exchange Online, enumerates every mailbox in the tenant,
@@ -17,7 +17,8 @@
 
     Each mailbox produces one "Primary" row. If the mailbox has an active in-place
     archive, a second "Archive" row is produced with the same Mailbox value so the
-    two can be matched during comparison.
+    two can be matched. The resulting CSV is suitable for capacity reporting,
+    audits, or reconciliation against any third-party mail-archiving report.
 
     ================================================================================
     INSTRUCTIONS FOR THE PERSON RUNNING THIS SCRIPT
@@ -63,7 +64,7 @@
            .\ExchangeOnlineInventory.ps1 -OutputPath "C:\Temp\Inventory.csv"
 
     5. When it finishes, the script prints the full path to the generated CSV
-       file. Please send that CSV back to Matthew Levy.
+       file.
 
     NOTES ON RUNTIME
     ----------------
@@ -109,7 +110,8 @@
 
 .NOTES
     Author  : Matthew Levy (MVP)
-    Purpose : Mailbox inventory for reconciliation against a Mimecast report.
+    Purpose : Exchange Online mailbox inventory (size, item count, and message
+              date range) exported to CSV.
     Version : 1.0
 
     This script only READS data from Exchange Online. It does not modify, move,
