@@ -70,13 +70,31 @@
     - The script may take a long time on large tenants because it reads folder
       statistics for every mailbox and every archive. This is expected.
     - A progress bar shows how far through the mailbox list the script is.
-    - If a single mailbox fails to return statistics, the script logs a warning
-      and continues with the remaining mailboxes.
+    - Exchange Online throttles heavy reporting workloads. The script detects
+      transient throttling/timeout/connection errors and automatically retries
+      each affected call with an increasing (exponential) back-off delay, and
+      re-establishes the Exchange Online session if it drops mid-run.
+    - If a mailbox still cannot be read after all retries, the script logs a
+      warning, records the mailbox in a companion "*_failures.log" file next to
+      the CSV, and continues with the remaining mailboxes. Always check that log
+      after a run so you know the report is complete.
+    - On very large tenants you can slow the script down with -ThrottleDelayMs
+      to reduce the chance of being throttled in the first place.
 
 .PARAMETER OutputPath
     Full path (including file name) for the CSV output. If omitted, the file is
     written to the current directory as:
         ExchangeOnlineInventory_<OrganisationName>_<yyyyMMdd_HHmmss>.csv
+
+.PARAMETER MaxRetries
+    Maximum number of automatic retries per failed statistics call when a
+    transient (throttling/timeout/connection) error occurs. Default is 5.
+    Set to 0 to disable retries.
+
+.PARAMETER ThrottleDelayMs
+    Optional pause, in milliseconds, inserted after each mailbox is processed.
+    Use this on large tenants to pace the script and avoid triggering dynamic
+    throttling. Default is 0 (no pause).
 
 .EXAMPLE
     .\ExchangeOnlineInventory.ps1
@@ -101,12 +119,94 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 20)]
+    [int]$MaxRetries = 5,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 60000)]
+    [int]$ThrottleDelayMs = 0
 )
 
 # Tracks whether THIS script opened the EXO connection, so we only disconnect
 # a session we created and leave any pre-existing session intact.
 $script:ConnectionOpenedByScript = $false
+
+function Test-TransientError {
+    # Returns $true for errors that are worth retrying: throttling, timeouts,
+    # service-busy, and dropped/expired connections.
+    param($ErrorRecord)
+
+    $msg = "$($ErrorRecord.Exception.Message)"
+    return ($msg -match '(?i)(429|503|throttl|ServerBusy|TooManyRequests|timed out|timeout|operation has timed|service is unavailable|connection was closed|session .*expired|token .*expired|unable to connect)')
+}
+
+function Get-ServerBackoffSeconds {
+    # Best-effort extraction of a server-suggested back-off from the error text.
+    # Returns 0 when none is found.
+    param($ErrorRecord)
+
+    $msg = "$($ErrorRecord.Exception.Message)"
+    if ($msg -match 'BackOffMilliseconds\D+(\d+)') {
+        return [int][math]::Ceiling([int]$matches[1] / 1000)
+    }
+    if ($msg -match 'retry after\D+(\d+)\s*second') {
+        return [int]$matches[1]
+    }
+    return 0
+}
+
+function Restore-EXOConnection {
+    # Re-establishes the Exchange Online session if it has dropped. Uses cached
+    # tokens when possible; may prompt for sign-in if the token has fully expired.
+    try {
+        $conn = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if (-not $conn) {
+            Write-Warning 'Exchange Online session lost; attempting to reconnect...'
+            Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+        }
+    }
+    catch {
+        Write-Warning "Reconnect attempt failed: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-WithRetry {
+    # Runs a script block, retrying transient failures with exponential back-off
+    # (capped at 60s) and reconnecting the session between attempts if needed.
+    # Non-transient errors, or errors past MaxRetries, are re-thrown.
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [string]$OperationName = 'operation',
+        [int]$MaxRetries = 5
+    )
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            $err = $_
+            if (-not (Test-TransientError -ErrorRecord $err) -or $attempt -gt $MaxRetries) {
+                throw
+            }
+
+            $backoff = [int][math]::Min([math]::Pow(2, $attempt), 60)
+            $serverBackoff = Get-ServerBackoffSeconds -ErrorRecord $err
+            if ($serverBackoff -gt $backoff) { $backoff = $serverBackoff }
+
+            Write-Warning ("{0}: transient error (attempt {1} of {2}); retrying in {3}s -> {4}" -f `
+                    $OperationName, $attempt, $MaxRetries, $backoff, $err.Exception.Message)
+
+            Restore-EXOConnection
+            Start-Sleep -Seconds $backoff
+        }
+    }
+}
 
 function Convert-SizeToBytes {
     # Parses the "12.34 GB (13,247,905,792 bytes)" string returned by the
@@ -143,7 +243,9 @@ function Get-MailboxDateRange {
     }
     if ($Archive) { $folderParams['Archive'] = $true }
 
-    $folders = Get-EXOMailboxFolderStatistics @folderParams
+    $folders = Invoke-WithRetry -OperationName "Get-EXOMailboxFolderStatistics ($Identity)" -MaxRetries $script:MaxRetries -ScriptBlock {
+        Get-EXOMailboxFolderStatistics @folderParams
+    }
 
     foreach ($folder in $folders) {
         if ($folder.OldestItemReceivedDate) {
@@ -180,7 +282,9 @@ function New-InventoryRow {
     }
     if ($MailboxType -eq 'Archive') { $statParams['Archive'] = $true }
 
-    $stats = Get-EXOMailboxStatistics @statParams
+    $stats = Invoke-WithRetry -OperationName "Get-EXOMailboxStatistics ($MailboxType $Mailbox)" -MaxRetries $script:MaxRetries -ScriptBlock {
+        Get-EXOMailboxStatistics @statParams
+    }
 
     $bytes = Convert-SizeToBytes -TotalItemSize $stats.TotalItemSize
     $dates = Get-MailboxDateRange -Identity $Identity -Archive:($MailboxType -eq 'Archive')
@@ -243,8 +347,14 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $OutputPath = Join-Path -Path (Get-Location) -ChildPath $fileName
 }
 
+# Companion failure log lives next to the CSV.
+$outDir = Split-Path -Parent $OutputPath
+if ([string]::IsNullOrEmpty($outDir)) { $outDir = (Get-Location).Path }
+$failureLogPath = Join-Path -Path $outDir -ChildPath (([System.IO.Path]::GetFileNameWithoutExtension($OutputPath)) + '_failures.log')
+
 # --- Inventory ----------------------------------------------------------------
 $results = [System.Collections.Generic.List[object]]::new()
+$failures = [System.Collections.Generic.List[object]]::new()
 
 try {
     Write-Host 'Retrieving mailbox list...' -ForegroundColor Cyan
@@ -267,7 +377,13 @@ try {
             $results.Add((New-InventoryRow -Mailbox $address -MailboxType 'Primary' -Identity $mbx.Identity))
         }
         catch {
-            Write-Warning "Failed to read primary statistics for '$address': $($_.Exception.Message)"
+            Write-Warning "Failed to read primary statistics for '$address' after retries: $($_.Exception.Message)"
+            $failures.Add([PSCustomObject]@{
+                    Timestamp   = (Get-Date)
+                    Mailbox     = $address
+                    MailboxType = 'Primary'
+                    Error       = $_.Exception.Message
+                })
         }
 
         # Archive mailbox (only if an active archive exists)
@@ -276,9 +392,17 @@ try {
                 $results.Add((New-InventoryRow -Mailbox $address -MailboxType 'Archive' -Identity $mbx.Identity))
             }
             catch {
-                Write-Warning "Failed to read archive statistics for '$address': $($_.Exception.Message)"
+                Write-Warning "Failed to read archive statistics for '$address' after retries: $($_.Exception.Message)"
+                $failures.Add([PSCustomObject]@{
+                        Timestamp   = (Get-Date)
+                        Mailbox     = $address
+                        MailboxType = 'Archive'
+                        Error       = $_.Exception.Message
+                    })
             }
         }
+
+        if ($ThrottleDelayMs -gt 0) { Start-Sleep -Milliseconds $ThrottleDelayMs }
     }
 
     Write-Progress -Activity 'Inventorying mailboxes' -Completed
@@ -299,6 +423,29 @@ if ($results.Count -gt 0) {
 }
 else {
     Write-Warning 'No mailbox data was collected; CSV was not created.'
+}
+
+# --- Write failure log (if any mailboxes could not be read) -------------------
+if ($failures.Count -gt 0) {
+    try {
+        $logLines = $failures | ForEach-Object {
+            '{0:u}  [{1}]  {2}  ::  {3}' -f $_.Timestamp, $_.MailboxType, $_.Mailbox, $_.Error
+        }
+        $header = @(
+            'Exchange Online Inventory - failure log',
+            "Generated : $(Get-Date -Format 'u')",
+            "Failures  : $($failures.Count)",
+            ('-' * 60)
+        )
+        Set-Content -Path $failureLogPath -Value ($header + $logLines) -Encoding UTF8
+        Write-Warning ("{0} mailbox/archive read(s) failed after retries. See: {1}" -f $failures.Count, $failureLogPath)
+    }
+    catch {
+        Write-Warning "Failed to write failure log to '$failureLogPath': $($_.Exception.Message)"
+    }
+}
+else {
+    Write-Host 'No mailbox read failures.' -ForegroundColor Green
 }
 
 # --- Disconnect (only the session this script created) ------------------------
