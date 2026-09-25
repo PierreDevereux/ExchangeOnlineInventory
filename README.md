@@ -1,10 +1,16 @@
 # ExchangeOnlineInventory
 
-A single, self-contained PowerShell script that inventories **all** Exchange Online
-mailboxes (user, shared, room, equipment, etc.) and their in-place archives, and
-exports the results to a CSV file.
+Self-contained PowerShell scripts that inventory Exchange Online mailboxes and
+export the results to CSV. Two scripts are provided:
 
-For every mailbox the script collects:
+- **`ExchangeOnlineInventory.ps1`** — inventories all **active** mailboxes (user,
+  shared, room, equipment, etc.) and their in-place archives.
+- **`InactiveMailboxInventory.ps1`** — inventories **inactive** mailboxes
+  (mailboxes of deleted users preserved by a hold), including the reason each is
+  held and the date it became inactive. See
+  [Inactive mailbox inventory](#inactive-mailbox-inventory).
+
+For every active mailbox `ExchangeOnlineInventory.ps1` collects:
 
 | Column           | Description                                             |
 | ---------------- | ------------------------------------------------------- |
@@ -156,6 +162,61 @@ Pace the script on a large tenant (200 ms pause after each mailbox):
 - **`<name>_failures.log`** — written **only if** one or more mailboxes could not
   be read after all retries. Lists the timestamp, mailbox, type, and error for
   each failure so you can confirm the report's completeness.
+
+---
+
+## Inactive mailbox inventory
+
+`InactiveMailboxInventory.ps1` is a **separate** script for **inactive mailboxes** —
+the mailboxes of deleted users that are preserved by a Litigation Hold, an
+eDiscovery or In-Place Hold, a Microsoft Purview retention policy/label, or a delay
+hold. These mailboxes are **not** returned by `ExchangeOnlineInventory.ps1`, so run
+this script if you need to account for them (for example, to compare against a
+3rd party archive of a former employee's mailbox).
+
+It collects the same size/count/date detail as the main script, plus hold and
+identity information:
+
+| Column                  | Description                                                                                                    |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `Mailbox`               | Primary SMTP address the mailbox had **before** deletion                                                       |
+| `DisplayName`           | Display name of the former user                                                                                |
+| `MailboxType`           | `Primary` or `Archive`                                                                                         |
+| `ExchangeGuid`          | Unique mailbox identifier (used for all lookups)                                                               |
+| `DistinguishedName`     | Unique directory identifier                                                                                    |
+| `HoldReasons`           | Why the mailbox is held: Litigation / eDiscovery / In-Place / Retention Policy / Retention Label / Delay Hold  |
+| `InPlaceHolds`          | Raw In-Place / retention hold identifiers (for audit)                                                          |
+| `LitigationHoldEnabled` | `True` / `False`                                                                                              |
+| `BecameInactive`        | Date the mailbox became inactive (`WhenSoftDeleted`)                                                           |
+| `Messages`              | Total item count                                                                                               |
+| `Size (bytes)`          | Total mailbox size in bytes                                                                                    |
+| `Size (GB)`             | Total mailbox size in gigabytes (rounded to 2 decimals)                                                        |
+| `Oldest Message`        | Received date of the oldest item across all folders                                                            |
+| `Newest Message`        | Received date of the newest item across all folders                                                            |
+
+> **SMTP address collisions:** an inactive mailbox can share its old SMTP address
+> with a **new active mailbox** that has since reused that address. The `Mailbox`
+> column shows the old address for comparison, but it is **not unique** — use
+> `ExchangeGuid` (or `DistinguishedName`) to identify the mailbox. All statistics
+> are looked up by `ExchangeGuid`, so the figures always refer to the correct
+> inactive mailbox regardless of any collision.
+
+> **Org-wide retention policies** do not stamp the `InPlaceHolds` property. If a
+> mailbox is inactive solely because of an organisation-wide retention policy,
+> `HoldReasons` reads "None detected…"; check `Get-OrganizationConfig | FL InPlaceHolds`.
+
+Prerequisites, installation, throttling behaviour, the `-OutputPath` /
+`-MaxRetries` / `-ThrottleDelayMs` parameters, and the `*_failures.log` output all
+work exactly as for the main script. Run it the same way:
+
+```powershell
+.\InactiveMailboxInventory.ps1
+```
+
+The default output file is
+`InactiveMailboxInventory_<OrganisationName>_<yyyyMMdd_HHmmss>.csv`. A
+**Compliance Administrator** or **Global Reader** role is recommended so all hold
+properties are readable.
 
 ---
 
